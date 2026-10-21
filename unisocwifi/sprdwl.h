@@ -89,6 +89,9 @@ struct scan_result {
 	unsigned char bssid[6];
 };
 
+/* Associated stations kept for cfg80211's dump_station() (AP mode). */
+#define SPRDWL_MAX_TRACKED_STA 16
+
 struct sprdwl_vif {
 	struct net_device *ndev;	/* Linux net device */
 	struct wireless_dev wdev;	/* Linux wireless device */
@@ -110,6 +113,10 @@ struct sprdwl_vif {
 	u8 bssid[ETH_ALEN];
 	unsigned char beacon_loss;
 	bool local_mac_flag;
+
+	/* softap peer bookkeeping, protected by priv->list_lock */
+	u8 sta_addr[SPRDWL_MAX_TRACKED_STA][ETH_ALEN];
+	int sta_count;
 
 	/* encryption stuff */
 	u8 prwise_crypto;
@@ -402,8 +409,10 @@ void sprdwl_net_flowcontrl(struct sprdwl_priv *priv,
 
 struct wireless_dev *sprdwl_add_iface(struct sprdwl_priv *priv,
 				      const char *name,
-				      enum nl80211_iftype type, u8 *addr);
-int sprdwl_del_iface(struct sprdwl_priv *priv, struct sprdwl_vif *vif);
+				      enum nl80211_iftype type, u8 *addr,
+				      bool cfg80211_ctx);
+int sprdwl_del_iface(struct sprdwl_priv *priv, struct sprdwl_vif *vif,
+		     bool cfg80211_ctx);
 struct sprdwl_priv *sprdwl_core_create(enum sprdwl_hw_type type,
 				       struct sprdwl_if_ops *ops);
 void sprdwl_core_free(struct sprdwl_priv *priv);

@@ -559,7 +559,7 @@ static struct wireless_dev *sprdwl_cfg80211_add_iface(struct wiphy *wiphy,
 		}
 	}
 
-	return sprdwl_add_iface(priv, name, iftype, params->macaddr);
+	return sprdwl_add_iface(priv, name, iftype, params->macaddr, true);
 }
 #endif
 
@@ -581,7 +581,7 @@ static int sprdwl_cfg80211_del_iface(struct wiphy *wiphy,
 	spin_unlock_bh(&priv->list_lock);
 
 	if (vif != NULL) {
-		sprdwl_del_iface(priv, vif);
+		sprdwl_del_iface(priv, vif, true);
 
 		spin_lock_bh(&priv->list_lock);
 		list_del(&vif->vif_node);
@@ -1318,6 +1318,10 @@ static int sprdwl_cfg80211_get_station(struct wiphy *wiphy,
 	wl_ndev_log(L_DBG, wdev->netdev, "%s signal %d legacy %d mcs:%d flags:0x:%x\n",
 			__func__, sinfo->signal, sinfo->txrate.legacy,
 			rate->mcs, rate->flags);
+
+	/* Firmware has no RX rate; mirror the TX rate (estimated). */
+	sinfo->rxrate = sinfo->txrate;
+	sinfo->filled |= BIT(NL80211_STA_INFO_RX_BITRATE);
 out:
 	return ret;
 }
@@ -1454,6 +1458,152 @@ out:
 
 
 
+/*
+ * cfg80211 needs dump_station() to enumerate the peers of an interface: this is
+ * what libiwinfo (and therefore LuCI) uses for the signal/bitrate of a client
+ * interface and for the "associated stations" list of an AP interface.
+ */
+
+/* Keep the set of softap peers; protected by priv->list_lock. */
+static void sprdwl_track_sta_add(struct sprdwl_vif *vif, const u8 *addr)
+{
+	int i;
+
+	if (!addr)
+		return;
+
+	spin_lock_bh(&vif->priv->list_lock);
+	for (i = 0; i < vif->sta_count; i++) {
+		if (ether_addr_equal(vif->sta_addr[i], addr))
+			goto out;
+	}
+	if (vif->sta_count < SPRDWL_MAX_TRACKED_STA)
+		ether_addr_copy(vif->sta_addr[vif->sta_count++], addr);
+out:
+	spin_unlock_bh(&vif->priv->list_lock);
+}
+
+static void sprdwl_track_sta_del(struct sprdwl_vif *vif, const u8 *addr)
+{
+	int i;
+
+	if (!addr)
+		return;
+
+	spin_lock_bh(&vif->priv->list_lock);
+	for (i = 0; i < vif->sta_count; i++) {
+		if (ether_addr_equal(vif->sta_addr[i], addr)) {
+			vif->sta_count--;
+			if (i != vif->sta_count)
+				ether_addr_copy(vif->sta_addr[i],
+						vif->sta_addr[vif->sta_count]);
+			break;
+		}
+	}
+	spin_unlock_bh(&vif->priv->list_lock);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+static int sprdwl_cfg80211_dump_station(struct wiphy *wiphy,
+					struct wireless_dev *wdev, int idx,
+					u8 *mac, struct station_info *sinfo)
+#else
+static int sprdwl_cfg80211_dump_station(struct wiphy *wiphy,
+					struct net_device *ndev, int idx,
+					u8 *mac, struct station_info *sinfo)
+#endif
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+	struct net_device *ndev = wdev->netdev;
+#endif
+	struct sprdwl_vif *vif = netdev_priv(ndev);
+	struct sprdwl_cmd_get_station sta;
+	struct sprdwl_rate_info *rate;
+	int ret;
+
+	memset(sinfo, 0, sizeof(*sinfo));
+
+	if (vif->mode != SPRDWL_MODE_AP) {
+		/* client: the only peer is the AP we are associated with */
+		if (idx != 0 || is_zero_ether_addr(vif->bssid))
+			return -ENOENT;
+		ether_addr_copy(mac, vif->bssid);
+	} else {
+		/* softap: walk the peers reported by the firmware */
+		spin_lock_bh(&vif->priv->list_lock);
+		if (idx >= vif->sta_count) {
+			spin_unlock_bh(&vif->priv->list_lock);
+			return -ENOENT;
+		}
+		ether_addr_copy(mac, vif->sta_addr[idx]);
+		spin_unlock_bh(&vif->priv->list_lock);
+	}
+
+	ret = sprdwl_get_station(vif->priv, vif->ctx_id, &sta);
+	if (ret)
+		return ret;
+	rate = (struct sprdwl_rate_info *)&sta;
+
+	sinfo->filled |= BIT(NL80211_STA_INFO_TX_BYTES) |
+			 BIT(NL80211_STA_INFO_TX_PACKETS) |
+			 BIT(NL80211_STA_INFO_RX_BYTES) |
+			 BIT(NL80211_STA_INFO_RX_PACKETS);
+	sinfo->tx_bytes = ndev->stats.tx_bytes;
+	sinfo->tx_packets = ndev->stats.tx_packets;
+	sinfo->rx_bytes = ndev->stats.rx_bytes;
+	sinfo->rx_packets = ndev->stats.rx_packets;
+
+	sinfo->signal = sta.signal;
+	sinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
+
+	sinfo->tx_failed = sta.txfailed;
+	sinfo->filled |= BIT(NL80211_STA_INFO_TX_BITRATE) |
+			 BIT(NL80211_STA_INFO_TX_FAILED);
+
+	if (!(rate->flags & 0x1c))
+		sinfo->txrate.bw = RATE_INFO_BW_20;
+	if (rate->flags & BIT(2))
+		sinfo->txrate.bw = RATE_INFO_BW_40;
+	if (rate->flags & BIT(3))
+		sinfo->txrate.bw = RATE_INFO_BW_80;
+	if ((rate->flags & BIT(4)) || (rate->flags & BIT(5)))
+		sinfo->txrate.bw = RATE_INFO_BW_160;
+	if (rate->flags & BIT(6))
+		sinfo->txrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+
+	if ((rate->flags & RATE_INFO_FLAGS_MCS) ||
+	    (rate->flags & RATE_INFO_FLAGS_VHT_MCS)) {
+		sinfo->txrate.flags = (rate->flags & 0x3);
+		sinfo->txrate.mcs = rate->mcs;
+		if ((rate->flags & RATE_INFO_FLAGS_VHT_MCS) && rate->nss)
+			sinfo->txrate.nss = rate->nss;
+	} else {
+		sinfo->txrate.legacy = rate->legacy;
+	}
+
+	/*
+	 * The firmware only returns one rate (the TX rate): neither the
+	 * WIFI_CMD_GET_STATION response nor the RX descriptors carry the
+	 * receive rate.  Mirror the TX rate into rxrate so libiwinfo shows a
+	 * plausible "RX Rate" instead of 0/unknown.  This is an estimate, not a
+	 * measurement of the receive path.
+	 */
+	sinfo->rxrate = sinfo->txrate;
+	sinfo->filled |= BIT(NL80211_STA_INFO_RX_BITRATE);
+
+	return 0;
+}
+
+static int sprdwl_cfg80211_get_tx_power(struct wiphy *wiphy,
+					struct wireless_dev *wdev, int *dbm)
+{
+	/* The firmware does not report the live TX power back; expose the value
+	 * the radio is configured with (the DTS caps the channels at 20 dBm). */
+	*dbm = 20;
+
+	return 0;
+}
+
 static int sprdwl_cfg80211_set_channel(struct wiphy *wiphy,
 				       struct net_device *ndev,
 				       struct ieee80211_channel *chan)
@@ -1491,6 +1641,7 @@ void sprdwl_report_softap(struct sprdwl_vif *vif, u8 is_connect, u8 *addr,
 			netif_carrier_on(vif->ndev);
 			netif_wake_queue(vif->ndev);
 		}
+		sprdwl_track_sta_add(vif, addr);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 		cfg80211_new_sta(&vif->wdev, addr, &sinfo, GFP_KERNEL);
 #else
@@ -1498,6 +1649,7 @@ void sprdwl_report_softap(struct sprdwl_vif *vif, u8 is_connect, u8 *addr,
 #endif
 		wl_ndev_log(L_DBG, vif->ndev, "New station (%pM) connected\n", addr);
 	} else {
+		sprdwl_track_sta_del(vif, addr);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 		cfg80211_del_sta(&vif->wdev, addr, GFP_KERNEL);
 #else
@@ -3588,59 +3740,22 @@ sprdwl_cfg80211_dump_survey(struct wiphy *wiphy, struct net_device *ndev,
 			    int idx, struct survey_info *s_info)
 {
 	struct sprdwl_vif *vif = netdev_priv(ndev);
-	struct sprdwl_survey_info *info = NULL;
-	struct sprdwl_bssid *bssid = NULL, *pos = NULL;
-	static int survey_count;
-	int err = 0;
 
-	if (vif->mode != SPRDWL_MODE_AP) {
-		wl_ndev_log(L_DBG, vif->ndev, "Not AP mode, exit %s!\n", __func__);
-		err = -ENOENT;
-		goto out;
-	}
+	/*
+	 * The list based implementation below handed survey->channel pointers to
+	 * cfg80211, which then dereferenced them in nl80211_dump_survey(); on
+	 * real hardware this ended in an "Unable to handle kernel paging
+	 * request" oops (triggered by hostapd's HT_SCAN when starting an AP).
+	 * That oops happens while RTNL is held, so the lock is never released
+	 * and the whole network stack wedges afterwards.
+	 *
+	 * ACS/DFS is not used by this port (the channel is configured in UCI and
+	 * the firmware has no usable survey data), so report "no survey data"
+	 * instead.  hostapd handles -ENOENT by skipping the survey step.
+	 */
+	wl_ndev_log(L_DBG, vif->ndev, "%s: survey not supported\n", __func__);
 
-	if (!list_empty(&vif->survey_info_list)) {
-		info = list_first_entry(&vif->survey_info_list,
-					struct sprdwl_survey_info, survey_list);
-		list_del(&info->survey_list);
-
-		if (info->channel) {
-			s_info->channel = info->channel;
-			s_info->noise = info->noise;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 83)
-			s_info->time = SPRDWL_ACS_SCAN_TIME;
-			s_info->time_busy = info->cca_busy_time;
-			s_info->filled = (SURVEY_INFO_NOISE_DBM |
-					SURVEY_INFO_TIME |
-					SURVEY_INFO_TIME_BUSY);
-#else
-			s_info->channel_time = SPRDWL_ACS_SCAN_TIME;
-			s_info->channel_time_busy = info->cca_busy_time;
-			s_info->filled = (SURVEY_INFO_NOISE_DBM |
-					  SURVEY_INFO_CHANNEL_TIME |
-					  SURVEY_INFO_CHANNEL_TIME_BUSY);
-#endif
-
-			survey_count++;
-		}
-
-		list_for_each_entry_safe(bssid, pos, &info->bssid_list, list) {
-			list_del(&bssid->list);
-			kfree(bssid);
-			bssid = NULL;
-		}
-
-		kfree(info);
-	} else {
-		/* There are no more survey info in list */
-		err = -ENOENT;
-		wl_ndev_log(L_DBG, vif->ndev, "%s report %d surveys\n",
-			    __func__, survey_count);
-		survey_count = 0;
-	}
-
-out:
-	return err;
+	return -ENOENT;
 }
 #endif /* ACS_SUPPORT */
 
@@ -3691,6 +3806,8 @@ static struct cfg80211_ops sprdwl_cfg80211_ops = {
 	.del_station = sprdwl_cfg80211_del_station,
 	.change_station = sprdwl_cfg80211_change_station,
 	.get_station = sprdwl_cfg80211_get_station,
+	.dump_station = sprdwl_cfg80211_dump_station,
+	.get_tx_power = sprdwl_cfg80211_get_tx_power,
 	.libertas_set_mesh_channel = sprdwl_cfg80211_set_channel,
 	.scan = sprdwl_cfg80211_scan,
 	.connect = sprdwl_cfg80211_connect,
